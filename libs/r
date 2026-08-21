@@ -1,0 +1,110 @@
+#include "routing/upcoming_speed_limit_provider.hpp"
+
+#include "routing/route.hpp"
+#include "routing/road_access.hpp"  // GetCurrentTimestamp()
+
+#include "routing_common/maxspeed_conversion.hpp"
+
+#include "platform/measurement_utils.hpp"
+
+#include "base/math.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+namespace
+{
+// A "change" closer than this is considered to be right on top of us and is
+// ignored.
+double constexpr kMinDistanceMeters = 1.0;
+
+// Distance from the route beginning to the start of segment |i| in meters.
+double SegmentStartFromBegin(std::vector<RouteSegment> const & segments, size_t i)
+{
+  return (i == 0) ? 0.0 : segments[i - 1].GetDistFromBeginningMeters();
+}
+}  // namespace
+
+namespace routing
+{
+
+void UpcomingSpeedLimitProvider::SetRoute(std::weak_ptr<Route> route)
+{
+  m_route = std::move(route);
+  m_cachedSegmentIndex = 0;
+}
+
+void UpcomingSpeedLimitProvider::Collect(double passedDistanceMeters, double horizonMeters,
+                                         std::vector<SpeedLimitChange> & out) const
+{
+  out.clear();
+  if (horizonMeters <= 0.0)
+    return;
+
+  auto route = m_route.lock();
+  if (!route)
+    return;
+
+  auto const & segments = route->GetRouteSegments();
+  size_t const n = segments.size();
+  if (n == 0)
+    return;
+
+  time_t const now = GetCurrentTimestamp();
+
+  // Locate the segment that contains the current position:
+  //   start(c) <= passed < end(c),  where end(c) == segments[c].distFromBegin.
+  // While driving the passed distance only grows, so the current index never
+  // decreases; the cache lets us start the search close to the current index.
+  size_t currentIdx = std::min(m_cachedSegmentIndex, n - 1);
+  while (currentIdx < n && passedDistanceMeters >= segments[currentIdx].GetDistFromBeginningMeters())
+    ++currentIdx;
+  currentIdx = (currentIdx == n) ? (n - 1) : currentIdx;
+
+  // The limit currently in effect is the limit of the segment we are in.
+  double lastEffectiveKmPH = -1.0;
+  {
+    SpeedInUnits const sl = segments[currentIdx].GetSpeedLimit(now);
+    if (sl.IsNumeric() && sl.IsValid())
+      lastEffectiveKmPH = sl.GetSpeedKmPH();
+  }
+
+  // Walk forward from the segment after the current one. A limit "change" for
+  // segment |i| happens at its start; we only emit it when the value actually
+  // differs from the last effective/emitted limit.
+  for (size_t i = currentIdx + 1; i < n; ++i)
+  {
+    double const distFromCurrent = SegmentStartFromBegin(segments, i) - passedDistanceMeters;
+
+    if (distFromCurrent < kMinDistanceMeters)
+      continue;
+    if (distFromCurrent > horizonMeters)
+      break;  // segments are ordered by distance; the rest is beyond the horizon.
+
+    SpeedInUnits const sl = segments[i].GetSpeedLimit(now);
+    // Only explicit, numeric OSM limits count. kNoneMaxSpeed (no restriction),
+    // invalid and undefined values are skipped so we never invent a limit.
+    if (!sl.IsNumeric() || !sl.IsValid())
+      continue;
+
+    double const limitKmPH = sl.GetSpeedKmPH();
+
+    // De-duplicate: skip if identical to the last effective/emitted limit.
+    if (lastEffectiveKmPH >= 0.0 && AlmostEqualAbs(limitKmPH, lastEffectiveKmPH, 1.0E-6))
+      continue;
+
+    SpeedLimitChange change;
+    change.m_distFromCurrentMeters = distFromCurrent;
+    change.m_speedMps = measurement_utils::KmphToMps(limitKmPH);
+    double const altMeters = segments[i - 1].GetJunction().GetAltitude();
+    change.m_altitudeMeters = (altMeters > 0.0) ? altMeters : 0.0;
+    change.m_hasExplicitData = true;
+
+    out.push_back(change);
+    lastEffectiveKmPH = limitKmPH;
+  }
+
+  m_cachedSegmentIndex = currentIdx;
+}
+
+}  // namespace routing
