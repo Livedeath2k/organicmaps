@@ -45,6 +45,10 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v6
 
+      - name: Make Gradle wrapper executable
+        shell: bash
+        run: chmod +x android/gradlew
+
       - name: Lint
         shell: bash
         working-directory: android
@@ -100,6 +104,10 @@ jobs:
         with:
           # Needed for versioning script
           fetch-depth: 200 # enough to get all commits for the current day
+
+      - name: Make Gradle wrapper executable
+        shell: bash
+        run: chmod +x android/gradlew
 
       - name: Parallel submodules checkout
         shell: bash
