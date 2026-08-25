@@ -1,0 +1,126 @@
+name: Android Developer Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        default: true
+      draft:
+        description: 'Create as draft (only visible to repo collaborators)'
+        type: boolean
+        default: false
+
+env:
+  JAVA_HOME: /usr/lib/jvm/temurin-17-jdk-amd64  # Java 17 is required for Android Gradle 8 plugin
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release Developer APK
+    runs-on: ubuntu-latest
+    environment: beta
+    steps:
+      - name: Install build tools and dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build
+
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 200 # enough to get all commits for versioning
+          ssh-key: ${{ secrets.RELEASE_SSH_KEY }}
+
+      - name: Parallel submodules checkout
+        shell: bash
+        run: git submodule update --depth 1 --init --recursive --jobs=$(($(nproc) * 20))
+
+      - name: Restore build keys
+        shell: bash
+        run: |
+          echo "$PRIVATE_H" | base64 -d > private.h
+          echo "$RELEASE_KEYSTORE" | base64 -d > android/app/release.keystore
+          echo "$SECURE_PROPERTIES" | base64 -d > android/app/secure.properties
+        env:
+          PRIVATE_H: ${{ secrets.PRIVATE_H }}
+          RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
+          SECURE_PROPERTIES: ${{ secrets.SECURE_PROPERTIES }}
+
+      - name: Set up SDK
+        shell: bash
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+
+      - name: Compute version info
+        id: version
+        shell: bash
+        run: |
+          version=$(tools/unix/version.sh ios_version)
+          build=$(tools/unix/version.sh count)
+          code=$(tools/unix/version.sh android_code)
+          tag="dev-${version}-${build}-android"
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "build=$build" >> $GITHUB_OUTPUT
+          echo "code=$code" >> $GITHUB_OUTPUT
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          git config user.name '${{ github.actor }}'
+          git config user.email '${{ github.actor }}@users.noreply.github.com'
+          git tag -a "${{ steps.version.outputs.tag }}" \
+            -m "Developer build ${{ steps.version.outputs.tag }} (commit ${GITHUB_SHA})"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Compile Web Release APK
+        shell: bash
+        working-directory: android
+        run: ./gradlew assembleWebRelease
+
+      - name: Generate sha256sum
+        shell: bash
+        working-directory: android/app/build/outputs/apk/web/release
+        run: |
+          sha256sum "OrganicMaps-${{ steps.version.outputs.code }}-web-release.apk" \
+            > "OrganicMaps-${{ steps.version.outputs.code }}-web-release.apk.sha256sum"
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          {
+            echo "## Developer Build ${{ steps.version.outputs.tag }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Commit** | \`${GITHUB_SHA}\` |"
+            echo "| **Branch** | \`${GITHUB_REF_NAME}\` |"
+            echo "| **Built by** | @${{ github.actor }} |"
+            echo "| **Date** | $(date -u '+%Y-%m-%d %H:%M UTC') |"
+            echo ""
+            echo "> ⚠️ This is a developer build for testing purposes. Not intended for production use."
+            echo ""
+            echo "### sha256sum"
+            echo '```'
+            tr -d '\n' < "./android/app/build/outputs/apk/web/release/OrganicMaps-${{ steps.version.outputs.code }}-web-release.apk.sha256sum"
+            echo ''
+            echo '```'
+          } > "${RUNNER_TEMP}/release-notes.txt"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ runner.temp }}/release-notes.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: Developer Build ${{ steps.version.outputs.tag }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          prerelease: ${{ inputs.prerelease }}
+          draft: ${{ inputs.draft }}
+          files: |
+            ./android/app/build/outputs/apk/web/release/OrganicMaps-${{ steps.version.outputs.code }}-web-release.apk
+            ./android/app/build/outputs/apk/web/release/OrganicMaps-${{ steps.version.outputs.code }}-web-release.apk.sha256sum
+          fail_on_unmatched_files: true
