@@ -176,11 +176,25 @@ jobs:
       #     the offline part of that coverage lives in storage_tests
       - name: Run tests
         if: ${{ matrix.environment.run-tests != 'OFF' }}
-        run: ctest --preset ci -j$(nproc --all)
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            JOBS=$(nproc --all)
+          else
+            JOBS=$(sysctl -n hw.logicalcpu)
+          fi
+          ctest --preset ci -j"$JOBS"
 
       # Run drape tests separately. They require offscreen rendering support.
       # The "ci-drape" test preset sets QT_QPA_PLATFORM=offscreen; setting it
       # globally breaks network tests on macOS.
       - name: Run drape tests
         if: ${{ matrix.environment.run-tests != 'OFF' }}
-        run: ctest --preset ci-drape --verbose
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            JOBS=$(nproc --all)
+          else
+            JOBS=$(sysctl -n hw.logicalcpu)
+          fi
+          ctest --preset ci-drape -j"$JOBS" --verbose
